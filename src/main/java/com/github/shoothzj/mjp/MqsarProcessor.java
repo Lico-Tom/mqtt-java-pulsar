@@ -6,9 +6,9 @@
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- *
- *  http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -22,37 +22,20 @@ package com.github.shoothzj.mjp;
 import com.github.shoothzj.mjp.config.MqsarConfig;
 import com.github.shoothzj.mjp.config.MqttConfig;
 import com.github.shoothzj.mjp.config.PulsarConfig;
+import com.github.shoothzj.mjp.module.MqsarBridgeKey;
 import com.github.shoothzj.mjp.module.MqttSessionKey;
 import com.github.shoothzj.mjp.module.MqttTopicKey;
 import com.github.shoothzj.mjp.util.ChannelUtils;
 import com.github.shoothzj.mjp.util.ClosableUtils;
+import com.github.shoothzj.mjp.util.MqsarReceiver;
 import com.github.shoothzj.mjp.util.MqttMessageUtil;
 import com.google.common.base.Preconditions;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.handler.codec.mqtt.MqttConnectMessage;
-import io.netty.handler.codec.mqtt.MqttMessage;
-import io.netty.handler.codec.mqtt.MqttUnsubscribeMessage;
-import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
-import io.netty.handler.codec.mqtt.MqttPublishMessage;
-import io.netty.handler.codec.mqtt.MqttPubAckMessage;
-import io.netty.handler.codec.mqtt.MqttIdentifierRejectedException;
-import io.netty.handler.codec.mqtt.MqttConnectReturnCode;
-import io.netty.handler.codec.mqtt.MqttConnAckVariableHeader;
-import io.netty.handler.codec.mqtt.MqttQoS;
-import io.netty.handler.codec.mqtt.MqttMessageType;
-import io.netty.handler.codec.mqtt.MqttFixedHeader;
-import io.netty.handler.codec.mqtt.MqttConnAckMessage;
-import io.netty.handler.codec.mqtt.MqttUnacceptableProtocolVersionException;
-import io.netty.handler.codec.mqtt.MqttMessageFactory;
-import io.netty.handler.codec.mqtt.MqttMessageIdVariableHeader;
+import io.netty.handler.codec.mqtt.*;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.compress.utils.Lists;
-import org.apache.pulsar.client.api.PulsarClient;
-import org.apache.pulsar.client.api.Producer;
-import org.apache.pulsar.client.api.Consumer;
-import org.apache.pulsar.client.api.PulsarClientException;
-import org.apache.pulsar.client.api.MessageId;
+import org.apache.pulsar.client.api.*;
 import org.apache.commons.lang3.StringUtils;
 import org.jetbrains.annotations.Nullable;
 
@@ -84,13 +67,16 @@ public class MqsarProcessor {
 
     private final Map<MqttTopicKey, Consumer<byte[]>> consumerMap;
 
+    private final Map<MqsarBridgeKey, Thread> threadMap;
+
     public MqsarProcessor(MqsarServer mqsarServer, MqsarConfig mqsarConfig) throws PulsarClientException {
         this.mqsarServer = mqsarServer;
         this.mqttConfig = mqsarConfig.getMqttConfig();
         this.pulsarConfig = mqsarConfig.getPulsarConfig();
-        this.pulsarClient = PulsarClient.builder()
+/*        this.pulsarClient = PulsarClient.builder()
                 .serviceUrl(String.format("pulsar://%s:%d", pulsarConfig.getHost(), pulsarConfig.getTcpPort()))
-                .build();
+                .build();*/
+        this.pulsarClient = null;
         ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
         rLock = lock.readLock();
         wLock = lock.writeLock();
@@ -98,6 +84,7 @@ public class MqsarProcessor {
         this.sessionConsumerMap = new HashMap<>();
         this.producerMap = new HashMap<>();
         this.consumerMap = new HashMap<>();
+        this.threadMap = new HashMap<>();
     }
 
     void processConnect(ChannelHandlerContext ctx, MqttConnectMessage msg) {
@@ -152,7 +139,7 @@ public class MqsarProcessor {
                             false, MqttQoS.AT_MOST_ONCE, false, 0),
                     new MqttConnAckVariableHeader(MqttConnectReturnCode.CONNECTION_REFUSED_USE_ANOTHER_SERVER,
                             false), null);
-          ctx.writeAndFlush(connAckMessage);
+            ctx.writeAndFlush(connAckMessage);
             ctx.close();
             return;
         }
@@ -279,6 +266,7 @@ public class MqsarProcessor {
     void processDisconnect(ChannelHandlerContext ctx, MqttMessage msg) {
         Channel channel = ctx.channel();
         closeMqttSession(ChannelUtils.getMqttSession(channel));
+        log.info("the close channel ...");
         ctx.close();
     }
 
@@ -286,9 +274,108 @@ public class MqsarProcessor {
     }
 
     void processSubscribe(ChannelHandlerContext ctx, MqttSubscribeMessage msg) {
+        log.info("the ctx {}", ctx);
+        List<MqttTopicSubscription> mqttTopicSubscriptions = msg.payload().topicSubscriptions();
+        MqttSessionKey mqttSession = ChannelUtils.getMqttSession(ctx.channel());
+        if (mqttSession == null) {
+            log.error("client address [{}]", ctx.channel().remoteAddress());
+            ctx.close();
+            return;
+        }
+        List<String> topicNames = Lists.newArrayList();
+        List<Integer> mqttQos = Lists.newArrayList();
+        for (MqttTopicSubscription mqttTopicSubscription : mqttTopicSubscriptions) {
+            topicNames.add(mqttTopicSubscription.topicName());
+            mqttQos.add(mqttTopicSubscription.qualityOfService().value());
+        }
+        MqttSubAckMessage mqttMessage = (MqttSubAckMessage) MqttMessageFactory.newMessage(
+                new MqttFixedHeader(MqttMessageType.SUBACK, false, MqttQoS.AT_MOST_ONCE, false, 0),
+                MqttMessageIdVariableHeader.from(msg.variableHeader().messageId()),
+                new MqttSubAckPayload(mqttQos)
+        );
+        ctx.writeAndFlush(mqttMessage);
+
+        for (MqttTopicSubscription mqttTopicSubscription : mqttTopicSubscriptions) {
+            String topicName = mqsarServer.produceTopic(mqttSession.getUsername(),
+                    mqttSession.getClientId(), mqttTopicSubscription.topicName());
+            try {
+                Consumer<byte[]> consumer = getOrCreateConsumer(mqttSession, topicName);
+                MqsarBridgeKey bridgeKey = new MqsarBridgeKey();
+                bridgeKey.setCtx(ctx);
+                bridgeKey.setTopic(topicName);
+                if (threadMap.containsKey(bridgeKey)) {
+                    MqsarReceiver mqsarReceiver = new MqsarReceiver(bridgeKey, mqttTopicSubscription.qualityOfService(), consumer);
+                    Thread thread = new Thread(mqsarReceiver);
+                    threadMap.put(bridgeKey, thread);
+                    thread.start();
+                }
+            } catch (PulsarClientException e) {
+                log.error("clientId [{}], username [{}], topicName [{}].create pulsar producer fail ",
+                        mqttSession.getClientId(), mqttSession.getUsername(), topicName, e);
+            }
+        }
+    }
+
+    private Consumer<byte[]> getOrCreateConsumer(MqttSessionKey mqttSessionKey, String topic) throws PulsarClientException {
+        MqttTopicKey subTopicKey = new MqttTopicKey();
+        subTopicKey.setTopic(topic);
+        subTopicKey.setMqttSessionKey(mqttSessionKey);
+        Consumer<byte[]> consumer = consumerMap.get(subTopicKey);
+        if (consumer == null) {
+            consumer = pulsarClient.newConsumer().topic(topic).subscribe();
+            List<MqttTopicKey> topicKeys = sessionConsumerMap.get(mqttSessionKey);
+            if (topicKeys == null) {
+                topicKeys = Lists.newArrayList();
+            }
+            topicKeys.add(subTopicKey);
+            sessionConsumerMap.put(mqttSessionKey, topicKeys);
+        }
+        return consumer;
     }
 
     void processUnSubscribe(ChannelHandlerContext ctx, MqttUnsubscribeMessage msg) {
+        MqttSessionKey mqttSession = ChannelUtils.getMqttSession(ctx.channel());
+        if (mqttSession == null) {
+            log.error("client address [{}]", ctx.channel().remoteAddress());
+            ctx.close();
+            return;
+        }
+        final List<String> topics = msg.payload().topics();
+        for (String topic : topics) {
+            String topicName = mqsarServer.produceTopic(mqttSession.getUsername(),
+                    mqttSession.getClientId(), topic);
+            MqsarBridgeKey bridgeKey = new MqsarBridgeKey();
+            bridgeKey.setCtx(ctx);
+            bridgeKey.setTopic(topicName);
+            wLock.lock();
+            try {
+                Thread thread = threadMap.get(bridgeKey);
+                thread.interrupt();
+                threadMap.remove(bridgeKey);
+            } finally {
+                wLock.unlock();
+            }
+
+        }
+        rLock.lock();
+        try {
+            List<MqttTopicKey> mqttTopicKeys = sessionConsumerMap.get(mqttSession);
+            if (mqttTopicKeys != null) {
+                for (MqttTopicKey mqttTopicKey : mqttTopicKeys) {
+                    consumerMap.remove(mqttTopicKey);
+                }
+            }
+            sessionConsumerMap.remove(mqttSession);
+        } finally {
+            rLock.unlock();
+        }
+
+        MqttUnsubAckMessage mqttMessage = (MqttUnsubAckMessage) MqttMessageFactory.newMessage(
+                new MqttFixedHeader(MqttMessageType.UNSUBACK, false, MqttQoS.AT_MOST_ONCE, false, 0),
+                MqttMessageIdVariableHeader.from(msg.variableHeader().messageId()), null
+        );
+        ctx.writeAndFlush(mqttMessage);
+
     }
 
     void processPingReq(ChannelHandlerContext ctx) {
